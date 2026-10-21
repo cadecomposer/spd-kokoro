@@ -74,8 +74,12 @@ if [ -f "$SPEECHD_CONF" ]; then
 fi
 
 if systemctl --user is-active --quiet speech-dispatcher 2>/dev/null; then
-    say "restarting speech-dispatcher.service"
+    say "restarting speech-dispatcher.service (user)"
     systemctl --user restart speech-dispatcher
+elif systemctl is-active --quiet speech-dispatcherd 2>/dev/null; then
+    say "restarting speech-dispatcherd.service (system, needs sudo)"
+    sudo systemctl daemon-reload
+    sudo systemctl restart speech-dispatcherd
 fi
 
 say "uninstalled"
