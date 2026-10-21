@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Protocol test harness for sd_kokoro.
+Protocol test harness for spd_kokoro.
 
 Starts the module exactly the way Speech Dispatcher does (config path as
 argv[1]), speaks the output-module protocol at it, and checks the replies.
@@ -34,7 +34,7 @@ import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MODULE = os.path.join(HERE, "sd_kokoro")
+MODULE = os.path.join(HERE, "spd_kokoro")
 CONFIG = os.path.join(HERE, "kokoro.conf")
 
 VERBOSE = False
@@ -380,7 +380,7 @@ def main() -> int:
         print(f"module not found: {MODULE}")
         return 2
 
-    tempdir = tempfile.mkdtemp(prefix="sd-kokoro-test-")
+    tempdir = tempfile.mkdtemp(prefix="spd-kokoro-test-")
     server = None
     try:
         player = fake_player(tempdir)

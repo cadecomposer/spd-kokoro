@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Remove the sd_kokoro module for the current user.
+# Remove the spd_kokoro module for the current user.
 #
 #   ./uninstall.sh            remove module + config, restore default module
 #   ./uninstall.sh --keep-config
@@ -33,9 +33,9 @@ SPEECHD_CONF="$CONFIG_DIR/speechd.conf"
 
 say() { echo "==> $*"; }
 
-if [ -f "$MODULE_DIR/sd_kokoro" ]; then
-    rm -f "$MODULE_DIR/sd_kokoro"
-    say "removed $MODULE_DIR/sd_kokoro"
+if [ -f "$MODULE_DIR/spd_kokoro" ]; then
+    rm -f "$MODULE_DIR/spd_kokoro"
+    say "removed $MODULE_DIR/spd_kokoro"
 fi
 
 if [ "$KEEP_CONFIG" -eq 0 ] && [ -f "$MODULE_CONFIG" ]; then
@@ -49,12 +49,12 @@ if [ -f "$SPEECHD_CONF" ]; then
         cp "$SPEECHD_CONF" "$BACKUP"
         say "backed up speechd.conf to $BACKUP"
         sed -i -E '/^[[:space:]]*AddModule[[:space:]]+"kokoro"/d' "$SPEECHD_CONF"
-        sed -i -E '/^# Added by sd-kokoro$/d' "$SPEECHD_CONF"
+        sed -i -E '/^# Added by spd-kokoro$/d' "$SPEECHD_CONF"
         say "removed AddModule line"
     fi
 
     if grep -qE '^[[:space:]]*DefaultModule[[:space:]]+"?kokoro"?' "$SPEECHD_CONF"; then
-        MARKER="$CONFIG_DIR/.sd-kokoro-previous-default"
+        MARKER="$CONFIG_DIR/.spd-kokoro-previous-default"
         sed -i -E '/^[[:space:]]*DefaultModule[[:space:]]+"?kokoro"?/d' "$SPEECHD_CONF"
         if [ -s "$MARKER" ]; then
             PREV=$(cat "$MARKER")
@@ -70,7 +70,7 @@ if [ -f "$SPEECHD_CONF" ]; then
             say "removed DefaultModule kokoro (no previous default found)"
         fi
     fi
-    rm -f "$CONFIG_DIR/.sd-kokoro-previous-default"
+    rm -f "$CONFIG_DIR/.spd-kokoro-previous-default"
 fi
 
 if systemctl --user is-active --quiet speech-dispatcher 2>/dev/null; then

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Install sd_kokoro for the current user.
+# Install spd_kokoro for the current user.
 #
 #   ./install.sh              add the module, keep the current default
 #   ./install.sh --default    add the module and make it the default
@@ -53,7 +53,7 @@ say "module directory: $MODULE_DIR"
 say "config directory: $MODULE_CONFIG_DIR"
 
 run mkdir -p "$MODULE_DIR" "$MODULE_CONFIG_DIR"
-run install -m 0755 "$ROOT/sd_kokoro" "$MODULE_DIR/sd_kokoro"
+run install -m 0755 "$ROOT/spd_kokoro" "$MODULE_DIR/spd_kokoro"
 
 if [ -f "$MODULE_CONFIG" ]; then
     say "keeping existing $MODULE_CONFIG"
@@ -80,9 +80,9 @@ if ! grep -qE '^[[:space:]]*AddModule[[:space:]]+"kokoro"' "$SPEECHD_CONF" 2>/de
     run cp "$SPEECHD_CONF" "$BACKUP"
     say "backed up speechd.conf to $BACKUP"
     if [ "$DRY_RUN" -eq 1 ]; then
-        echo "    [dry-run] append: AddModule \"kokoro\" \"sd_kokoro\" \"kokoro.conf\""
+        echo "    [dry-run] append: AddModule \"kokoro\" \"spd_kokoro\" \"kokoro.conf\""
     else
-        printf '\n# Added by sd-kokoro\nAddModule "kokoro" "sd_kokoro" "kokoro.conf"\n' \
+        printf '\n# Added by spd-kokoro\nAddModule "kokoro" "spd_kokoro" "kokoro.conf"\n' \
             >> "$SPEECHD_CONF"
     fi
     say "added AddModule line"
@@ -91,7 +91,7 @@ else
 fi
 
 if [ "$SET_DEFAULT" -eq 1 ]; then
-    MARKER="$CONFIG_DIR/.sd-kokoro-previous-default"
+    MARKER="$CONFIG_DIR/.spd-kokoro-previous-default"
     if grep -qE '^[[:space:]]*DefaultModule[[:space:]]+"?kokoro"?' "$SPEECHD_CONF"; then
         say "kokoro is already the default module"
         # Record the previous default for uninstall.sh, if we can find it.

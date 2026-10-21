@@ -1,4 +1,4 @@
-# sd-kokoro
+# spd-kokoro
 
 A [Speech Dispatcher](https://freebsoft.org/speechd) output module that
 speaks through any **OpenAI-compatible `/v1/audio/speech`** endpoint.
@@ -17,7 +17,7 @@ Orca / Firefox / spd-say
 speech-dispatcher
         │  output-module protocol (stdin/stdout)
         ▼
-sd_kokoro  ──HTTP POST /v1/audio/speech──▶  Kokoro-FastAPI :8880
+spd_kokoro  ──HTTP POST /v1/audio/speech──▶  Kokoro-FastAPI :8880
         │
         └──plays WAV with pw-play / paplay / mpv / ffplay / aplay
 ```
@@ -50,7 +50,7 @@ The installer puts:
 
 | File | Location |
 | --- | --- |
-| module binary | `~/.local/libexec/speech-dispatcher-modules/sd_kokoro` |
+| module binary | `~/.local/libexec/speech-dispatcher-modules/spd_kokoro` |
 | module config | `~/.config/speech-dispatcher/modules/kokoro.conf` |
 | server config | `~/.config/speech-dispatcher/speechd.conf` |
 
@@ -180,7 +180,7 @@ back to normal client-driven selection and logs a warning.
 
 ## How it works
 
-`sd_kokoro` implements Speech Dispatcher's output-module protocol
+`spd_kokoro` implements Speech Dispatcher's output-module protocol
 (`INIT`, `AUDIO`, `LOGLEVEL`, `SET`, `LIST VOICES`, `SPEAK`,
 `CHAR`, `KEY`, `SOUND_ICON`, `STOP`, `PAUSE`, `QUIT`). For each utterance
 it:
@@ -208,7 +208,7 @@ spd-say -o kokoro -w "test"
 Turn on the module log:
 
 ```conf
-KokoroLog "/tmp/sd-kokoro.log"
+KokoroLog "/tmp/spd-kokoro.log"
 ```
 
 then restart Speech Dispatcher and try again. The log records the chosen
@@ -226,7 +226,7 @@ Make sure the binary is executable and in the directory Speech
 Dispatcher uses:
 
 ```bash
-ls -l ~/.local/libexec/speech-dispatcher-modules/sd_kokoro
+ls -l ~/.local/libexec/speech-dispatcher-modules/spd_kokoro
 systemctl --user restart speech-dispatcher
 ```
 
@@ -260,7 +260,7 @@ KokoroPlayerArgs "--target alsa_output.pci-0000_00_1f.3.analog-stereo"
 
 | File | Purpose |
 | --- | --- |
-| `sd_kokoro` | The output module (Python, stdlib only). |
+| `spd_kokoro` | The output module (Python, stdlib only). |
 | `kokoro.conf` | Module configuration. |
 | `install.sh` | Per-user installer. |
 | `uninstall.sh` | Per-user uninstaller. |

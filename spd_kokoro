@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-sd_kokoro -- Speech Dispatcher output module for Kokoro TTS.
+spd_kokoro -- Speech Dispatcher output module for Kokoro TTS.
 
 Speaks text through any OpenAI-compatible /v1/audio/speech endpoint
 (tested with kokoro-fastapi) and plays the returned audio locally.
@@ -102,7 +102,7 @@ DEFAULTS = {
     "KokoroVolume": "1.0",          # extra master gain, 0.0 - 1.0
     "KokoroMinSpeed": "0.5",
     "KokoroMaxSpeed": "2.0",
-    "KokoroLog": "",                # e.g. /tmp/sd-kokoro.log
+    "KokoroLog": "",                # e.g. /tmp/spd-kokoro.log
     # Report "en-US-x-af-heart" style tags instead of plain "en-US".
     "KokoroUniqueLangTags": "0",
     # Ignore client voice/language requests and always speak with
@@ -132,11 +132,11 @@ class Log:
                 os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
                 self._fh = open(path, "a", encoding="utf-8", buffering=1)
             except OSError as exc:
-                print(f"sd_kokoro: cannot open log {path}: {exc}",
+                print(f"spd_kokoro: cannot open log {path}: {exc}",
                       file=sys.stderr, flush=True)
 
     def __call__(self, message: str) -> None:
-        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} sd_kokoro: {message}\n"
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} spd_kokoro: {message}\n"
         with self._lock:
             if self._fh:
                 try:
@@ -173,7 +173,7 @@ class Config:
             with open(path, "r", encoding="utf-8") as fh:
                 lines = fh.readlines()
         except OSError as exc:
-            print(f"sd_kokoro: cannot read config {path}: {exc}",
+            print(f"spd_kokoro: cannot read config {path}: {exc}",
                   file=sys.stderr, flush=True)
             return
 
@@ -586,7 +586,7 @@ class KokoroModule:
 
         suffix = "." + (self.config.get("KokoroFormat") or "wav")
         tmp = tempfile.NamedTemporaryFile(
-            prefix="sd_kokoro-", suffix=suffix, delete=False)
+            prefix="spd_kokoro-", suffix=suffix, delete=False)
         path = tmp.name
         ok = False
         try:
@@ -716,7 +716,7 @@ class KokoroModule:
             self.current_job = job
         thread = threading.Thread(
             target=self._speak_worker, args=(job,),
-            name="sd_kokoro-speak", daemon=True)
+            name="spd_kokoro-speak", daemon=True)
         thread.start()
 
     def _speak_worker(self, job: SpeakJob) -> None:
@@ -790,7 +790,7 @@ class KokoroModule:
         if line.strip() != "INIT":
             self.log(f"expected INIT, got {line!r}")
             return False
-        self.emit(f"299-sd_kokoro {MODULE_VERSION}: Kokoro TTS ready")
+        self.emit(f"299-spd_kokoro {MODULE_VERSION}: Kokoro TTS ready")
         self.emit("299 OK LOADED SUCCESSFULLY")
         return True
 
