@@ -123,8 +123,13 @@ fi
 # --- restart the server ---------------------------------------------------
 if [ "$DRY_RUN" -eq 0 ]; then
     if systemctl --user is-active --quiet speech-dispatcher 2>/dev/null; then
-        say "restarting speech-dispatcher.service"
+        say "restarting speech-dispatcher.service (user)"
         systemctl --user restart speech-dispatcher
+        sleep 1
+    elif systemctl is-active --quiet speech-dispatcherd 2>/dev/null; then
+        say "restarting speech-dispatcherd.service (system, needs sudo)"
+        sudo systemctl daemon-reload
+        sudo systemctl restart speech-dispatcherd
         sleep 1
     else
         say "speech-dispatcher is not running; it will pick up the new config on next start"
