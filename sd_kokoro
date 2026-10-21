@@ -1,0 +1,905 @@
+#!/usr/bin/env python3
+"""
+sd_kokoro -- Speech Dispatcher output module for Kokoro TTS.
+
+Speaks text through any OpenAI-compatible /v1/audio/speech endpoint
+(tested with kokoro-fastapi) and plays the returned audio locally.
+
+The module speaks the Speech Dispatcher output-module protocol on
+stdin/stdout.  It has no third-party dependencies; only the Python
+standard library is used.
+
+Protocol summary (server -> module):
+    INIT
+    AUDIO  <key=value>...  .
+    LOGLEVEL <key=value>... .
+    SET    <key=value>...  .
+    LIST VOICES [language [variant]]
+    SPEAK / CHAR / KEY / SOUND_ICON  <text lines> .
+    STOP / PAUSE / DEBUG / QUIT
+
+This program is free software; you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the
+Free Software Foundation; either version 2 of the License, or (at your
+option) any later version.
+"""
+
+from __future__ import annotations
+
+import html
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.request
+
+MODULE_NAME = "kokoro"
+MODULE_VERSION = "1.1.0"
+
+# Voice-id prefix -> BCP-47-ish language tag.  Kokoro voice ids look like
+# "af_heart": the first letter is the language, the second the gender.
+LANGUAGE_BY_PREFIX = {
+    "a": "en-US",
+    "b": "en-GB",
+    "e": "es",
+    "f": "fr",
+    "h": "hi",
+    "i": "it",
+    "j": "ja",
+    "p": "pt-BR",
+    "z": "zh",
+}
+
+# Used when the voices endpoint cannot be reached, so that the module can
+# still initialize and clients still see a sensible voice list.
+FALLBACK_VOICE_IDS = [
+    "af_heart", "af_alloy", "af_aoede", "af_bella", "af_jessica",
+    "af_kore", "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
+    "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam",
+    "am_michael", "am_onyx", "am_puck", "am_santa",
+    "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
+    "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
+    "ef_dora", "em_alex", "em_santa", "ff_siwis",
+    "hf_alpha", "hf_beta", "hm_omega", "hm_psi",
+    "if_sara", "im_nicola", "jf_alpha", "jf_gongitsune", "jf_nezumi",
+    "jf_tebukuro", "jm_kumo", "pf_dora", "pm_alex", "pm_santa",
+    "zf_xiaobei", "zf_xiaoni", "zf_xiaoxiao", "zf_xiaoyi",
+    "zm_yunjian", "zm_yunxi", "zm_yunxia", "zm_yunyang",
+]
+
+DEFAULT_LANGUAGE_VOICES = {
+    "en-US": "af_heart",
+    "en-GB": "bf_alice",
+    "es": "ef_dora",
+    "fr": "ff_siwis",
+    "hi": "hf_alpha",
+    "it": "if_sara",
+    "ja": "jf_alpha",
+    "pt-BR": "pf_dora",
+    "zh": "zf_xiaobei",
+}
+
+DEFAULTS = {
+    "KokoroURL": "http://localhost:8880/v1/audio/speech",
+    "KokoroVoicesURL": "",          # derived from KokoroURL when empty
+    "KokoroAPIKey": "",
+    "KokoroModel": "kokoro",
+    "KokoroVoice": "af_heart",      # fallback/default synthesis voice
+    "KokoroFormat": "wav",
+    "KokoroTimeout": "30",
+    "KokoroChunkChars": "600",
+    "KokoroPlayer": "auto",
+    "KokoroPlayerArgs": "",
+    "KokoroVolume": "1.0",          # extra master gain, 0.0 - 1.0
+    "KokoroMinSpeed": "0.5",
+    "KokoroMaxSpeed": "2.0",
+    "KokoroLog": "",                # e.g. /tmp/sd-kokoro.log
+    # Report "en-US-x-af-heart" style tags instead of plain "en-US".
+    "KokoroUniqueLangTags": "0",
+    # Ignore client voice/language requests and always speak with
+    # KokoroVoice.
+    "KokoroPinVoice": "0",
+}
+
+SENTENCE_END = re.compile(r"(?<=[.!?\u2026\u3002\uff01\uff1f;])\s+|\n+")
+KNOWN_SSML = re.compile(
+    r"</?(?:speak|voice|prosody|break|say-as|emphasis|p|s|sub|mark|audio)\b",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+class Log:
+    def __init__(self, path: str = "", debug: bool = False):
+        self._lock = threading.Lock()
+        self._fh = None
+        self._stderr = debug
+        if path:
+            path = os.path.expanduser(path)
+            try:
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                self._fh = open(path, "a", encoding="utf-8", buffering=1)
+            except OSError as exc:
+                print(f"sd_kokoro: cannot open log {path}: {exc}",
+                      file=sys.stderr, flush=True)
+
+    def __call__(self, message: str) -> None:
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} sd_kokoro: {message}\n"
+        with self._lock:
+            if self._fh:
+                try:
+                    self._fh.write(line)
+                except OSError:
+                    pass
+            if self._stderr:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._fh:
+                try:
+                    self._fh.close()
+                except OSError:
+                    pass
+                self._fh = None
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+class Config:
+    def __init__(self, path: str | None):
+        self.values = dict(DEFAULTS)
+        self.path = path
+        if path:
+            self._load(path)
+
+    def _load(self, path: str) -> None:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                lines = fh.readlines()
+        except OSError as exc:
+            print(f"sd_kokoro: cannot read config {path}: {exc}",
+                  file=sys.stderr, flush=True)
+            return
+
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                parts = shlex.split(line, comments=True, posix=True)
+            except ValueError:
+                continue
+            if len(parts) < 2:
+                continue
+            key = parts[0]
+            value = " ".join(parts[1:])
+            # Be forgiving about key case, e.g. kokoroURL.
+            for known in DEFAULTS:
+                if known.lower() == key.lower():
+                    key = known
+                    break
+            self.values[key] = value
+
+    def get(self, key: str) -> str:
+        return self.values.get(key, DEFAULTS.get(key, ""))
+
+    def get_float(self, key: str, default: float) -> float:
+        try:
+            return float(self.get(key))
+        except (TypeError, ValueError):
+            return default
+
+    def get_int(self, key: str, default: int) -> int:
+        try:
+            return int(float(self.get(key)))
+        except (TypeError, ValueError):
+            return default
+
+
+# ---------------------------------------------------------------------------
+# Voices
+# ---------------------------------------------------------------------------
+
+class Voice:
+    __slots__ = ("name", "language", "variant")
+
+    def __init__(self, name: str, language: str, variant: str):
+        self.name = name
+        self.language = language
+        self.variant = variant
+
+
+def voice_from_id(voice_id: str) -> Voice:
+    prefix = voice_id[:2].lower()
+    language = "en-US"
+    if len(prefix) >= 1 and prefix[0] in LANGUAGE_BY_PREFIX:
+        language = LANGUAGE_BY_PREFIX[prefix[0]]
+    variant = "none"
+    if len(prefix) >= 2:
+        if prefix[1] == "f":
+            variant = "female"
+        elif prefix[1] == "m":
+            variant = "male"
+    return Voice(voice_id, language, variant)
+
+
+def language_matches(requested: str, language: str) -> bool:
+    req = requested.lower().replace("_", "-")
+    lang = language.lower().replace("_", "-")
+    if req == lang:
+        return True
+    # "en" should match "en-US" and "en-GB".
+    if "-" not in req and lang.startswith(req + "-"):
+        return True
+    return False
+
+
+def variant_matches(requested: str, variant: str) -> bool:
+    req = requested.lower()
+    if req in ("", "none"):
+        return True
+    gender = {
+        "f": "female", "female": "female", "female1": "female",
+        "female2": "female", "female3": "female", "woman": "female",
+        "m": "male", "male": "male", "male1": "male", "male2": "male",
+        "male3": "male", "man": "male",
+    }.get(req)
+    if gender:
+        return variant.lower() == gender
+    return variant.lower() == req
+
+
+def enabled(value: str) -> bool:
+    """Config values are strings; accept the usual spellings of "yes"."""
+    return value.strip().lower() in ("1", "yes", "true", "on")
+
+
+# ---------------------------------------------------------------------------
+# A unit of work ("job") so that STOP/PAUSE cannot race a new utterance.
+# ---------------------------------------------------------------------------
+
+class SpeakJob:
+    def __init__(self, text: str, msgtype: str):
+        self.text = text
+        self.msgtype = msgtype
+        self.cancel = threading.Event()
+        self.reason = "stop"       # "stop" or "pause"
+        self.proc: subprocess.Popen | None = None
+        self.done = threading.Event()
+
+
+# ---------------------------------------------------------------------------
+# Main module
+# ---------------------------------------------------------------------------
+
+class KokoroModule:
+    def __init__(self, config: Config):
+        self.config = config
+        self.log = Log(
+            config.get("KokoroLog"),
+            debug=bool(os.environ.get("SD_KOKORO_DEBUG")),
+        )
+        self._out_lock = threading.Lock()
+        self._job_lock = threading.Lock()
+        self.current_job: SpeakJob | None = None
+        self.settings: dict[str, str] = {}
+        self.voices: list[Voice] | None = None
+        self.player = self._resolve_player()
+        self.log(f"version {MODULE_VERSION} starting "
+                 f"(config={config.path or '<none>'}, player={self.player or '<none>'})")
+
+    # -- output ------------------------------------------------------------
+
+    def emit(self, line: str) -> None:
+        """Send one protocol line to the Speech Dispatcher server."""
+        with self._out_lock:
+            try:
+                sys.stdout.write(line + "\n")
+                sys.stdout.flush()
+            except (BrokenPipeError, OSError):
+                os._exit(1)
+
+    # -- stdin -------------------------------------------------------------
+
+    @staticmethod
+    def readline() -> str | None:
+        data = sys.stdin.buffer.readline()
+        if not data:
+            return None
+        return data.decode("utf-8", "replace").rstrip("\r\n")
+
+    def read_params(self) -> dict[str, str]:
+        """Read key=value lines terminated by a lone dot."""
+        params: dict[str, str] = {}
+        while True:
+            line = self.readline()
+            if line is None:
+                return params
+            if line == ".":
+                return params
+            if "=" in line:
+                key, value = line.split("=", 1)
+                params[key.strip()] = value
+        # unreachable
+
+    # -- voices ------------------------------------------------------------
+
+    def _voices_url(self) -> str:
+        url = self.config.get("KokoroVoicesURL").strip()
+        if url:
+            return url
+        speech_url = self.config.get("KokoroURL").strip()
+        if "/v1/audio/speech" in speech_url:
+            return speech_url.replace("/v1/audio/speech", "/v1/audio/voices")
+        return speech_url.rstrip("/") + "/v1/audio/voices"
+
+    def _api_headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        key = self.config.get("KokoroAPIKey").strip()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        return headers
+
+    def load_voices(self) -> list[Voice]:
+        if self.voices is not None:
+            return self.voices
+
+        voices: list[Voice] = []
+        try:
+            request = urllib.request.Request(
+                self._voices_url(), headers=self._api_headers())
+            with urllib.request.urlopen(request, timeout=3.0) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            raw = payload.get("voices", payload) if isinstance(payload, dict) else payload
+            if isinstance(raw, list):
+                for item in raw:
+                    if isinstance(item, str):
+                        voice_id = item
+                    elif isinstance(item, dict):
+                        voice_id = item.get("id") or item.get("name")
+                    else:
+                        voice_id = None
+                    if voice_id:
+                        voices.append(voice_from_id(str(voice_id)))
+        except Exception as exc:  # noqa: BLE001 - never fail module startup
+            self.log(f"could not fetch voices from {self._voices_url()}: {exc}")
+
+        if not voices:
+            self.log("using built-in fallback voice list")
+            voices = [voice_from_id(v) for v in FALLBACK_VOICE_IDS]
+
+        # Keep a stable, useful order: language, gender, name.
+        voices.sort(key=lambda v: (v.language, v.variant, v.name))
+        self.voices = voices
+        self.log(f"loaded {len(voices)} voices")
+        return voices
+
+    def _reported_language(self, voice: Voice) -> str:
+        """The language tag sent to clients for this voice.
+
+        Firefox's Reader Mode (Narrate) labels every voice with its language
+        on Linux and ignores the voice name, so distinct tags are the only
+        way to tell voices apart there.  ``KokoroUniqueLangTags`` appends a
+        private-use subtag with the voice id, e.g. "en-US-x-af-heart", which
+        Firefox shows as "English (en-US-x-af-heart)".  Filtering and voice
+        selection keep using the plain language.
+        """
+        if not enabled(self.config.get("KokoroUniqueLangTags")):
+            return voice.language
+        return f"{voice.language}-x-{voice.name.replace('_', '-')}"
+
+    def list_voices(self, request_line: str) -> None:
+        tokens = request_line.split()
+        requested_language = tokens[2] if len(tokens) >= 3 else ""
+        requested_variant = tokens[3] if len(tokens) >= 4 else ""
+
+        voices = self.load_voices()
+        selected = [
+            v for v in voices
+            if (not requested_language
+                or language_matches(requested_language, v.language))
+            and (not requested_variant
+                 or variant_matches(requested_variant, v.variant))
+        ]
+        # Many clients ask for a language/variant combination that we do not
+        # have exactly (e.g. "en-US male1").  Returning the language is more
+        # useful than returning nothing.
+        if not selected and requested_language:
+            selected = [
+                v for v in voices
+                if language_matches(requested_language, v.language)
+            ]
+
+        if not selected:
+            self.emit("304 CANT LIST VOICES")
+            return
+
+        for voice in selected:
+            self.emit(f"200-{voice.name}\t"
+                      f"{self._reported_language(voice)}\t{voice.variant}")
+        self.emit("200 OK VOICE LIST SENT")
+
+    # -- synthesis ---------------------------------------------------------
+
+    def _setting(self, name: str, default: str = "") -> str:
+        value = self.settings.get(name, default)
+        if value is None or value == "NULL":
+            return ""
+        return value
+
+    def _choose_voice(self) -> str:
+        if enabled(self.config.get("KokoroPinVoice")):
+            configured = self.config.get("KokoroVoice")
+            available = {v.name for v in self.load_voices()}
+            if configured in available:
+                return configured
+            self.log(f"KokoroPinVoice: {configured!r} is not a known voice, "
+                     f"falling back to client selection")
+
+        requested = self._setting("synthesis_voice")
+        available = {v.name for v in self.load_voices()}
+        if requested and requested in available:
+            return requested
+
+        language = self._setting("language")
+        if language:
+            candidates = [
+                v for v in self.load_voices()
+                if language_matches(language, v.language)
+            ]
+            if candidates:
+                # Prefer the configured default voice when it matches.
+                configured = self.config.get("KokoroVoice")
+                for voice in candidates:
+                    if voice.name == configured:
+                        return voice.name
+                # Prefer a female voice, which is what most TTS defaults use.
+                for voice in candidates:
+                    if voice.variant == "female":
+                        return voice.name
+                return candidates[0].name
+
+        configured = self.config.get("KokoroVoice")
+        if configured in available:
+            return configured
+        return next(iter(available)) if available else "af_heart"
+
+    def _speed(self) -> float:
+        try:
+            rate = int(self._setting("rate", "0"))
+        except ValueError:
+            rate = 0
+        speed = 2.0 ** (max(-100, min(100, rate)) / 100.0)
+        minimum = self.config.get_float("KokoroMinSpeed", 0.5)
+        maximum = self.config.get_float("KokoroMaxSpeed", 2.0)
+        if minimum > 0:
+            speed = max(speed, minimum)
+        if maximum > 0:
+            speed = min(speed, maximum)
+        return round(speed, 3)
+
+    def _gain(self) -> float:
+        try:
+            volume = int(self._setting("volume", "100"))
+        except ValueError:
+            volume = 100
+        gain = (max(-100, min(100, volume)) + 100) / 200.0
+        gain *= max(0.0, min(1.0, self.config.get_float("KokoroVolume", 1.0)))
+        return max(0.0, min(1.0, gain))
+
+    @staticmethod
+    def clean_text(text: str, msgtype: str) -> str:
+        if msgtype in ("CHAR", "KEY") and text == "space":
+            return " "
+        if msgtype == "TEXT" and text == "space":
+            return " "
+
+        # Speech Dispatcher may pass SSML through.  Strip index marks and,
+        # when the input really looks like SSML, the markup itself.
+        text = re.sub(r"<mark\b[^>]*/?>", " ", text, flags=re.IGNORECASE)
+        if KNOWN_SSML.search(text):
+            text = re.sub(r"<[^>]+>", " ", text)
+            text = html.unescape(text)
+
+        # Drop control characters but keep normal whitespace.
+        text = "".join(
+            ch if ch in "\n\t\r" or ord(ch) >= 32 else " " for ch in text
+        )
+        text = re.sub(r"[ \t\r\f\v]+", " ", text)
+        return text.strip()
+
+    @staticmethod
+    def chunk_text(text: str, max_chars: int) -> list[str]:
+        text = text.strip()
+        if not text:
+            return []
+        if len(text) <= max_chars:
+            return [text]
+
+        sentences = [s.strip() for s in SENTENCE_END.split(text) if s.strip()]
+        chunks: list[str] = []
+        current = ""
+        for sentence in sentences:
+            if len(sentence) > max_chars:
+                if current:
+                    chunks.append(current)
+                    current = ""
+                chunks.extend(KokoroModule._split_long(sentence, max_chars))
+            elif not current:
+                current = sentence
+            elif len(current) + 1 + len(sentence) <= max_chars:
+                current += " " + sentence
+            else:
+                chunks.append(current)
+                current = sentence
+        if current:
+            chunks.append(current)
+        return chunks
+
+    @staticmethod
+    def _split_long(text: str, max_chars: int) -> list[str]:
+        pieces: list[str] = []
+        rest = text.strip()
+        while len(rest) > max_chars:
+            window = rest[:max_chars]
+            cut = max(window.rfind(" "), window.rfind(","),
+                      window.rfind(";"), window.rfind(":"))
+            if cut < max_chars // 2:
+                cut = max_chars
+            pieces.append(rest[:cut].strip())
+            rest = rest[cut:].strip()
+        if rest:
+            pieces.append(rest)
+        return pieces
+
+    def synthesize(self, text: str, job: SpeakJob) -> str | None:
+        payload = {
+            "model": self.config.get("KokoroModel"),
+            "input": text,
+            "voice": self._choose_voice(),
+            "response_format": self.config.get("KokoroFormat") or "wav",
+            "speed": self._speed(),
+        }
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            self.config.get("KokoroURL"),
+            data=data,
+            headers=self._api_headers(),
+            method="POST",
+        )
+
+        suffix = "." + (self.config.get("KokoroFormat") or "wav")
+        tmp = tempfile.NamedTemporaryFile(
+            prefix="sd_kokoro-", suffix=suffix, delete=False)
+        path = tmp.name
+        ok = False
+        try:
+            timeout = self.config.get_float("KokoroTimeout", 30.0)
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                while True:
+                    if job.cancel.is_set():
+                        return None
+                    block = response.read(65536)
+                    if not block:
+                        break
+                    tmp.write(block)
+            ok = tmp.tell() > 0
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read(512).decode("utf-8", "replace").strip()
+            except Exception:  # noqa: BLE001
+                detail = ""
+            self.log(f"synthesis HTTP {exc.code} from {self.config.get('KokoroURL')}: "
+                     f"{detail or exc.reason}")
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"synthesis failed: {exc}")
+        finally:
+            tmp.close()
+
+        if not ok or job.cancel.is_set():
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return None
+        return path
+
+    # -- playback ----------------------------------------------------------
+
+    def _resolve_player(self) -> str | None:
+        configured = self.config.get("KokoroPlayer").strip()
+        if configured and configured.lower() != "auto":
+            return configured if os.path.exists(configured) or shutil.which(configured) else None
+        for candidate in ("pw-play", "paplay", "mpv", "ffplay", "aplay"):
+            found = shutil.which(candidate)
+            if found:
+                return found
+        return None
+
+    def _player_command(self, path: str, gain: float) -> list[str]:
+        player = self.player or "aplay"
+        extra = shlex.split(self.config.get("KokoroPlayerArgs"))
+        name = os.path.basename(player)
+
+        if name == "pw-play":
+            cmd = [player, "--volume", f"{gain:.3f}"]
+        elif name == "paplay":
+            cmd = [player, f"--volume={max(0, min(65536, int(gain * 65536)))}"]
+        elif name == "mpv":
+            cmd = [player, "--no-video", "--really-quiet",
+                   f"--volume={max(0, min(100, int(gain * 100)))}"]
+        elif name == "ffplay":
+            cmd = [player, "-nodisp", "-autoexit", "-loglevel", "quiet",
+                   "-volume", str(max(0, min(100, int(gain * 100))))]
+        else:
+            cmd = [player]
+        return cmd + extra + [path]
+
+    def play(self, path: str, job: SpeakJob) -> None:
+        gain = self._gain()
+        if gain <= 0.0:
+            self.log("volume is zero; skipping playback")
+            return
+        if not self.player:
+            self.log("no audio player found (tried pw-play, paplay, mpv, ffplay, aplay)")
+            return
+
+        command = self._player_command(path, gain)
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            self.log(f"could not start player {command[0]}: {exc}")
+            return
+
+        job.proc = proc
+        try:
+            while proc.poll() is None:
+                if job.cancel.is_set():
+                    self._kill_process(proc)
+                    break
+                time.sleep(0.02)
+        finally:
+            job.proc = None
+        if proc.returncode not in (0, -signal.SIGKILL, -signal.SIGTERM):
+            self.log(f"player exited with status {proc.returncode}: {' '.join(command)}")
+
+    @staticmethod
+    def _kill_process(proc: subprocess.Popen) -> None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    # -- speaking ----------------------------------------------------------
+
+    def cancel_current(self, reason: str = "stop", wait: float = 3.0) -> None:
+        with self._job_lock:
+            job = self.current_job
+        if job is None:
+            return
+        job.reason = reason
+        job.cancel.set()
+        proc = job.proc
+        if proc is not None:
+            self._kill_process(proc)
+        job.done.wait(wait)
+
+    def start_speaking(self, text: str, msgtype: str) -> None:
+        self.cancel_current("stop", wait=2.0)
+        job = SpeakJob(text, msgtype)
+        with self._job_lock:
+            self.current_job = job
+        thread = threading.Thread(
+            target=self._speak_worker, args=(job,),
+            name="sd_kokoro-speak", daemon=True)
+        thread.start()
+
+    def _speak_worker(self, job: SpeakJob) -> None:
+        began = False
+        try:
+            text = self.clean_text(job.text, job.msgtype)
+            chunks = self.chunk_text(
+                text, self.config.get_int("KokoroChunkChars", 600))
+
+            if job.msgtype == "SOUND_ICON" or not chunks:
+                self.emit("701 BEGIN")
+                self.emit("702 END")
+                return
+
+            for chunk in chunks:
+                if job.cancel.is_set():
+                    break
+                audio = self.synthesize(chunk, job)
+                if job.cancel.is_set():
+                    if audio:
+                        self._unlink(audio)
+                    break
+                if audio is None:
+                    # The endpoint is unreachable or rejected the request.
+                    # Do not hammer it once per chunk; complete the message.
+                    break
+                if not began:
+                    self.emit("701 BEGIN")
+                    began = True
+                try:
+                    self.play(audio, job)
+                finally:
+                    self._unlink(audio)
+                if job.cancel.is_set():
+                    break
+
+            if job.cancel.is_set():
+                self.emit("704 PAUSE" if job.reason == "pause" else "703 STOP")
+            elif began:
+                self.emit("702 END")
+            else:
+                # Synthesis failed completely; still complete the message so
+                # that the server does not wait forever.
+                self.emit("701 BEGIN")
+                self.emit("702 END")
+        except Exception:  # noqa: BLE001 - never kill the module
+            self.log("speak worker crashed:\n" + traceback.format_exc())
+            if not began:
+                self.emit("701 BEGIN")
+            self.emit("702 END")
+        finally:
+            with self._job_lock:
+                if self.current_job is job:
+                    self.current_job = None
+            job.done.set()
+
+    @staticmethod
+    def _unlink(path: str) -> None:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    # -- protocol ----------------------------------------------------------
+
+    def handshake(self) -> bool:
+        line = self.readline()
+        if line is None:
+            self.log("server closed stdin before INIT")
+            return False
+        if line.strip() != "INIT":
+            self.log(f"expected INIT, got {line!r}")
+            return False
+        self.emit(f"299-sd_kokoro {MODULE_VERSION}: Kokoro TTS ready")
+        self.emit("299 OK LOADED SUCCESSFULLY")
+        return True
+
+    def handle_audio(self) -> None:
+        self.emit("207 OK RECEIVING AUDIO SETTINGS")
+        params = self.read_params()
+        # Refuse server-side audio: this module plays the returned audio
+        # itself, so the Speech Dispatcher server must not manage playback.
+        if params.get("audio_output_method") == "server":
+            self.emit("303 ERROR INVALID PARAMETER OR VALUE")
+            return
+        self.emit("203 OK AUDIO INITIALIZED")
+
+    def handle_set(self) -> None:
+        self.emit("203 OK RECEIVING SETTINGS")
+        params = self.read_params()
+        self.settings.update(params)
+        self.log(f"settings: {params}")
+        self.emit("203 OK SETTINGS RECEIVED")
+
+    def handle_loglevel(self) -> None:
+        self.emit("207 OK RECEIVING LOGLEVEL SETTINGS")
+        self.read_params()
+        self.emit("203 OK LOGLEVEL SET")
+
+    def read_message(self) -> str:
+        lines: list[str] = []
+        while True:
+            line = self.readline()
+            if line is None:
+                break
+            if line == ".":
+                break
+            # The server doubles a leading dot; undo that.
+            if line.startswith("."):
+                line = line[1:]
+            lines.append(line)
+        return "\n".join(lines)
+
+    def handle_speak(self, msgtype: str) -> None:
+        self.emit("202 OK RECEIVING MESSAGE")
+        text = self.read_message()
+        self.emit("200 OK SPEAKING")
+        self.start_speaking(text, msgtype)
+
+    def loop(self) -> int:
+        while True:
+            line = self.readline()
+            if line is None:
+                self.log("stdin closed, exiting")
+                return 0
+            command = line.strip()
+
+            if command == "AUDIO":
+                self.handle_audio()
+            elif command == "LOGLEVEL":
+                self.handle_loglevel()
+            elif command == "SET":
+                self.handle_set()
+            elif command.startswith("LIST VOICES"):
+                self.list_voices(command)
+            elif command in ("SPEAK", "CHAR", "KEY", "SOUND_ICON"):
+                self.handle_speak(command)
+            elif command == "STOP":
+                self.cancel_current("stop")
+            elif command == "PAUSE":
+                self.cancel_current("pause")
+            elif command.startswith("DEBUG"):
+                parts = command.split()
+                self.emit(f"200 OK DEBUGGING {parts[1] if len(parts) > 1 else 'OFF'}")
+            elif command == "QUIT":
+                self.cancel_current("stop", wait=2.0)
+                self.emit("210 OK QUIT")
+                self.log("QUIT received")
+                return 0
+            elif command == "":
+                continue
+            else:
+                self.log(f"unknown command: {command!r}")
+                self.emit("300 ERR UNKNOWN COMMAND")
+
+    def close(self) -> None:
+        self.cancel_current("stop", wait=2.0)
+        self.log.close()
+
+
+def find_config_path() -> str | None:
+    if len(sys.argv) > 1:
+        return sys.argv[1]
+    env = os.environ.get("SD_KOKORO_CONFIG")
+    if env:
+        return env
+    default = os.path.expanduser("~/.config/speech-dispatcher/modules/kokoro.conf")
+    if os.path.exists(default):
+        return default
+    return None
+
+
+def main() -> int:
+    config = Config(find_config_path())
+    module = KokoroModule(config)
+    if not module.handshake():
+        module.close()
+        return 1
+    try:
+        return module.loop()
+    finally:
+        module.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
